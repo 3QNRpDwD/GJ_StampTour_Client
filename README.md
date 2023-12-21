@@ -2,6 +2,9 @@
 GJ_StampTour
 
 
-pip install requests
-pip install openpyxl
-pip install pandas
+pip install requests                                 
+
+pip install openpyxl                                          
+
+pip install pandas                                         
+
