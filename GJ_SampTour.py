@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-통합 스크립트: (1) 로컬 어드민에 주기적 autosave POST 전송
-               (2) 콘솔 명령 수신 -> 어드민 응답에서 stamp_history 처리 -> 엑셀/CSV 저장
-               (3) 파일(resources/database/stamp_status.json) 직접 처리 -> 중복 제거 / 티켓 계산 / CSV 저장
-로깅: 콘솔(INFO) + 파일(DEBUG)로 처리 과정을 상세히 기록합니다.
-사용법:
-  - 그냥 실행하면 autosave와 명령 입력 루프가 동작합니다.
-  - 콘솔에서:
-      save all                -> 서버에 "save all" 전송 (원래 동작)
-      stamp status            -> 스템프 데이터베이스 출력
-      process file            -> resources/database/stamp_status.json 파일을 읽어 처리
-      process file /경로/파일  -> 지정한 파일을 읽어 처리
-      exit / quit             -> 프로그램 종료
-      (그 외 입력은 admin에 그대로 전송되고, stamp_history가 있으면 자동으로 처리/저장)
-"""
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
 GJ_SampTour_Client.py
 Rust 서버(Actix-web) 규격에 맞춘 어드민 클라이언트 스크립트
 
 수정 내역:
-  - 서버의 'save all' 응답(단순 문자열)과 'stamp status' 응답(Rust Debug Struct)을 구분하여 처리
-  - Rust Debug 포맷 문자열을 JSON으로 변환하기 위한 파싱 로직 강화
+  - 서버가 이제 'stamp status' 요청에 대해 표준 JSON 문자열을 반환합니다.
+  - 이에 따라 불안정한 텍스트 파싱 로직을 제거하고 표준 JSON 파싱으로 교체했습니다.
 """
 
 import requests
@@ -80,21 +63,6 @@ def normalize_user_name(name: str) -> str:
         pass
     return s
 
-def safe_json_loads(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        # JSON 형식이 아닐 경우, 중괄호 구간만 추출 시도
-        try:
-            first = s.find('{')
-            last = s.rfind('}')
-            if first != -1 and last != -1 and last > first:
-                candidate = s[first:last+1]
-                return json.loads(candidate)
-        except Exception:
-            pass
-    return None
-
 def dedupe_user_count_by_name(user_count: dict):
     name_to_best = {}
     for uid, info in user_count.items():
@@ -118,11 +86,13 @@ def process_history_to_outputs(history: dict,
     기존 파라미터 규격을 유지하면서, 
     CSV 저장 시에만 '학번이름'을 스탬프 개수(10개당 1번)만큼 반복 저장합니다.
     """
-    logger.debug("데이터 집계 시작 (기존 규격 유지)")
+    logger.info("데이터 집계 및 출력 시작. Excel: '%s', CSV: '%s'", excel_path, csv_path)
     
     user_stats = {} 
-    # 1. 데이터 집계 (기존 로직 유지)
+    # 1. 데이터 집계
+    logger.debug("===== 1. 데이터 집계 시작 =====")
     for stamp_id, users in history.items():
+        logger.debug("스탬프 ID '%s' 처리 중. 사용자 수: %d", stamp_id, len(users))
         for u in users:
             if isinstance(u, dict):
                 uid = u.get("student_id") or u.get("user_id") or u.get("id")
@@ -131,103 +101,130 @@ def process_history_to_outputs(history: dict,
                 uid = str(u)
                 raw_name = ""
             
-            if uid is None: continue
+            if uid is None:
+                logger.warning("UID가 없어 건너뜁니다: %s", u)
+                continue
             
             norm_name = normalize_user_name(raw_name)
+            
             if uid not in user_stats:
+                logger.debug("새 사용자 발견: UID=%s, 이름=%s", uid, norm_name)
                 user_stats[uid] = {"name": norm_name, "locations": set()}
-            user_stats[uid]["locations"].add(str(stamp_id))
+            
+            if str(stamp_id) not in user_stats[uid]["locations"]:
+                user_stats[uid]["locations"].add(str(stamp_id))
+                logger.debug("UID '%s'에 스탬프 '%s' 추가. 현재 총 %d개", uid, stamp_id, len(user_stats[uid]["locations"]))
+            else:
+                logger.debug("UID '%s'에 스탬프 '%s'는 이미 존재하여 건너뜁니다.", uid, stamp_id)
 
-    # 2. 엑셀 저장 (기존 규격대로 생성하되 내용은 간소화 가능)
-    # (요청하신 내용에 엑셀에 대한 언급은 없었으나 기존 코드 호환을 위해 유지)
+    logger.info("데이터 집계 완료. 총 %d명의 고유 사용자 발견.", len(user_stats))
+    logger.debug("===== 1. 데이터 집계 종료 =====")
+
+    # 2. 엑셀 저장
+    logger.debug("===== 2. Excel 파일 저장 시작 =====")
     try:
         df_data = []
         for uid, info in user_stats.items():
-            df_data.append({"user_id": uid, "user_name": info["name"], "count": len(info["locations"])})
-        pd.DataFrame(df_data).to_excel(excel_path, index=False)
+            count = len(info["locations"])
+            df_data.append({"user_id": uid, "user_name": info["name"], "count": count})
+            logger.debug("Excel 데이터 준비: UID=%s, 이름=%s, 스탬프 수=%d", uid, info["name"], count)
+        
+        df = pd.DataFrame(df_data)
+        df.to_excel(excel_path, index=False)
+        logger.info("Excel 저장 완료: '%s'에 %d명 데이터 저장", excel_path, len(df_data))
     except Exception as e:
         logger.error("Excel 저장 실패: %s", e)
+    logger.debug("===== 2. Excel 파일 저장 종료 =====")
 
-    # 3. CSV 저장 (핵심 변경 부분: 학번이름 반복 출력)
+    # 3. CSV 저장
+    logger.debug("===== 3. CSV 추첨 명단 저장 시작 =====")
+    count_total_rows = 0
     try:
         with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            count_total_rows = 0
+            logger.info("CSV 파일 개방 완료: '%s'", csv_path)
             
             for uid, info in user_stats.items():
                 cnt = len(info['locations'])
-                # 10개 미만은 제외 (기존 로직 조건 유지)
+                display_name = info['name']
+                logger.debug("CSV 처리 사용자: UID=%s, 이름=%s, 스탬프 수=%d", uid, display_name, cnt)
+                
+                # 10개 미만은 제외
                 if cnt < min_required_unique:
+                    logger.debug("사용자 '%s' (UID: %s)는 스탬프 개수(%d)가 최소 요건(%d) 미만이라 제외.", display_name, uid, cnt, min_required_unique)
                     continue
                 
-                # 출력 횟수: 10개 이상 1번, 20개 이상 2번, 30개 이상 3번
+                # 출력 횟수: 10개 이상 1번, 20개 이상 2번...
                 repeat_count = cnt // 10
-                display_name = f"{uid}{info['name']}" # 예: 12345김유저
+                logger.debug("사용자 '%s' (UID: %s)는 추첨 명단에 %d번 포함됩니다.", display_name, uid, repeat_count)
                 
-                for _ in range(repeat_count):
+                for i in range(repeat_count):
                     writer.writerow([display_name])
+                    logger.debug(" > '%s' 1회 기록 (총 %d회 중 %d번째)", display_name, repeat_count, i+1)
                     count_total_rows += 1
             
             logger.info("CSV 저장 완료: 총 %d줄 기록됨", count_total_rows)
     except Exception as e:
         logger.error("CSV 저장 실패: %s", e)
+    logger.debug("===== 3. CSV 추첨 명단 저장 종료 =====")
 
-    # 리턴 형식 유지 (기존 코드에서 summary 출력 시 사용)
     return {"total_users": len(user_stats), "recorded_rows": count_total_rows}
 
-def parse_rust_debug_output(output_text: str):
+def parse_admin_response_output(output_text: str):
     """
-    Rust 서버가 반환하는 Debug 포맷({:?}) 문자열을 JSON으로 변환하여 파싱합니다.
-    형태 예시: StampHistory { stamp_history: {"1": [StampUserInfo { ... }]} }
+    [수정됨]
+    Rust 서버가 이제 serde_json::to_string으로 직렬화된 유효한 JSON 문자열을 반환합니다.
+    복잡한 문자열 처리 없이 json.loads로 파싱합니다.
     """
     if not output_text:
         return None
 
-    # 1. 구조체 이름 제거 (StampHistory { ... } -> { ... })
-    # 영문자+숫자+언더바 뒤에 공백(선택)과 중괄호가 오면, 그냥 중괄호로 변경
-    s = re.sub(r'[a-zA-Z0-9_]+\s*\{', '{', output_text)
-    
-    # 2. 키 값에 따옴표 붙이기 (key: -> "key":)
-    # 주의: URL(http:)이나 시간(12:00) 등이 값에 포함될 경우 오동작 가능성이 있으나,
-    # 현재 데이터 구조(단순 필드명)에서는 이 정규식으로 충분합니다.
-    s = re.sub(r'([a-zA-Z0-9_]+):', r'"\1":', s)
-    
-    # 3. Trailing Comma 제거 (콤마 뒤에 닫는 괄호/중괄호가 오면 콤마 삭제)
-    s = re.sub(r',\s*([\]}])', r'\1', s)
-
     try:
-        # 4. JSON 변환 시도
-        data = json.loads(s)
-        
-        # 5. [중요] 데이터 구조 맞추기
-        # 서버 응답이 { "stamp_history": { ... } } 형태라면,
-        # 내부의 { ... } 만 반환해야 기존 로직(process_history_to_outputs)이 정상 작동함
-        if isinstance(data, dict) and "stamp_history" in data:
-            return data["stamp_history"]
-        
-        return data
+        # 1. JSON 문자열 파싱
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError:
+        # "save all" 등의 명령어는 일반 텍스트(예: "All databases saved")를 반환하므로 무시
+        return None
 
-    except json.JSONDecodeError as e:
-        # 파싱 실패 시 원본 문자열 일부를 로그에 남겨 디버깅 도움
-        logger.error(f"JSON 파싱 실패: {e}")
-        logger.debug(f"파싱 시도한 문자열(앞부분): {s[:100]}")
-        return None
-    except Exception as e:
-        logger.error(f"알 수 없는 오류: {e}")
-        return None
+    # 2. stamp_history 추출
+    if isinstance(parsed, dict):
+        # Rust 구조체: struct StampHistory { stamp_history: HashMap<...> }
+        # JSON 형태: {"stamp_history": { ... }}
+        if "stamp_history" in parsed:
+            return parsed["stamp_history"]
+        
+        # 만약 구조가 직접 Map이라면 그대로 반환
+        return parsed
+
+    return None
 
 def process_file(input_file=DEFAULT_INPUT_JSON):
-    logger.info("로컬 파일 처리: %s", input_file)
+    logger.info("로컬 파일 처리 시작: %s", input_file)
     if not os.path.exists(input_file):
-        logger.error("파일 없음: %s", input_file)
+        logger.error("파일을 찾을 수 없습니다: %s", input_file)
         return
+    
     try:
+        logger.debug("파일 열기: %s", input_file)
         with open(input_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        history = data.get('stamp_history') or data
+        logger.debug("JSON 파싱 완료. 최상위 키: %s", list(data.keys()))
+        
+        # 'stamp_history' 키가 있는지 확인, 없으면 data 자체를 history로 간주
+        if 'stamp_history' in data:
+            history = data['stamp_history']
+            logger.info("'stamp_history' 키를 발견하여 사용합니다. 스탬프 종류: %d개", len(history))
+        else:
+            history = data
+            logger.info("최상위 객체를 history로 사용합니다. 스탬프 종류: %d개", len(history))
+            
         process_history_to_outputs(history)
+        logger.info("로컬 파일 처리 완료: %s", input_file)
+        
+    except json.JSONDecodeError as e:
+        logger.error("JSON 파싱 오류: %s - %s", input_file, e)
     except Exception as e:
-        logger.error("파일 처리 중 오류: %s", e)
+        logger.error("파일 처리 중 예외 발생: %s", e)
 
 # -------------------------
 # 스레드 함수들
@@ -259,38 +256,48 @@ def handle_cmd_loop(admin_url):
             # 1. 로컬 파일 처리 명령
             if cmd.startswith("process_file"):
                 parts = cmd.split(maxsplit=1)
+                logger.debug("'process_file' 명령 분리 결과: %s", parts)
                 target_file = parts[1].strip() if len(parts) > 1 else DEFAULT_INPUT_JSON
+                logger.info("'process_file' 명령 실행. 대상 파일: %s", target_file)
                 process_file(target_file)
                 continue
 
             # 2. 서버 전송 명령
             logger.debug("서버 전송: %s", cmd)
-            r = requests.post(admin_url, json={"command": cmd, "output": ""}, timeout=10)
-            
             try:
+                r = requests.post(admin_url, json={"command": cmd, "output": ""}, timeout=10)
+                r.raise_for_status() # HTTP 에러 체크
+                
                 resp_json = r.json()
                 output_text = resp_json.get("output", "")
-            except:
-                output_text = r.text
+            except Exception as e:
+                logger.error("통신 오류 또는 잘못된 응답: %s", e)
+                continue
 
             # 3. 명령어에 따른 응답 처리 분기
             if cmd == "save all":
-                # save all은 데이터를 주지 않음. 성공 메시지만 출력.
+                # save all은 데이터를 주지 않음. 메시지만 출력.
                 logger.info("서버 응답: %s", output_text)
             
             elif cmd == "stamp status":
-                # stamp status는 데이터를 줌 (Rust Debug Format)
-                logger.info("데이터 수신 완료. 파싱 시작...")
-                history = parse_rust_debug_output(output_text)
+                # stamp status는 이제 JSON String을 줌
+                logger.info("데이터 수신 완료. JSON 파싱 시작...")
+                
+                # [수정됨] 새 파싱 함수 호출
+                history = parse_admin_response_output(output_text)
+                
                 if history:
                     summary = process_history_to_outputs(history)
                     logger.info("처리 완료: %s", summary)
                 else:
-                    logger.warning("데이터 파싱 실패. 원본 응답 확인 필요.")
-                    logger.debug("Raw Output: %s", output_text[:200]) # 너무 기니 앞부분만
+                    logger.warning("데이터 파싱 실패 혹은 데이터 없음.")
+                    if output_text and len(output_text) > 200:
+                         logger.debug("Raw Output (앞부분): %s", output_text[:200])
+                    else:
+                         logger.debug("Raw Output: %s", output_text)
             
             else:
-                # 그 외 명령 (unknown 등)
+                # 그 외 명령
                 logger.info("서버 응답: %s", output_text)
 
         except Exception as e:
