@@ -9,8 +9,9 @@
   - 그냥 실행하면 autosave와 명령 입력 루프가 동작합니다.
   - 콘솔에서:
       save all                -> 서버에 "save all" 전송 (원래 동작)
-      process_file            -> resources/database/stamp_status.json 파일을 읽어 처리
-      process_file /경로/파일  -> 지정한 파일을 읽어 처리
+      stamp status            -> 스템프 데이터베이스 출력
+      process file            -> resources/database/stamp_status.json 파일을 읽어 처리
+      process file /경로/파일  -> 지정한 파일을 읽어 처리
       exit / quit             -> 프로그램 종료
       (그 외 입력은 admin에 그대로 전송되고, stamp_history가 있으면 자동으로 처리/저장)
 """
@@ -312,13 +313,13 @@ def handle_cmd_loop(admin_url=ADMIN_URL):
                 logger.info("프로그램 종료 명령 수신. 종료합니다.")
                 os._exit(0)
             # 파일 처리 명령
-            if cmd.startswith("process_file"):
+            if cmd.startswith("process file"):
                 parts = cmd.split(maxsplit=1)
                 if len(parts) == 1:
                     infile = DEFAULT_INPUT_JSON
                 else:
                     infile = parts[1].strip()
-                logger.info("process_file 명령: input=%s", infile)
+                logger.info("process file 명령: input=%s", infile)
                 process_file(infile)
                 continue
 
