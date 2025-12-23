@@ -31,7 +31,7 @@ import re
 # 설정
 # -------------------------
 ADMIN_URL = "http://localhost:80/admin"
-AUTOSAVE_INTERVAL_MIN = 15
+AUTOSAVE_INTERVAL_MIN = 1
 DEFAULT_EXCEL_PATH = "./stamp_user.xlsx"
 DEFAULT_CSV_PATH = "./final_event_result.csv"
 DEFAULT_INPUT_JSON = "resources/database/stamp_status.json"
