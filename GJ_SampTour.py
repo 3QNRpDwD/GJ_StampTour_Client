@@ -175,7 +175,7 @@ def process_history_to_outputs(history: dict,
     # 리턴 형식 유지 (기존 코드에서 summary 출력 시 사용)
     return {"total_users": len(user_stats), "recorded_rows": count_total_rows}
 
-  def parse_rust_debug_output(output_text: str):
+def parse_rust_debug_output(output_text: str):
     """
     Rust 서버가 반환하는 Debug 포맷({:?}) 문자열을 JSON으로 변환하여 파싱합니다.
     형태 예시: StampHistory { stamp_history: {"1": [StampUserInfo { ... }]} }
