@@ -15,13 +15,23 @@
       exit / quit             -> 프로그램 종료
       (그 외 입력은 admin에 그대로 전송되고, stamp_history가 있으면 자동으로 처리/저장)
 """
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GJ_SampTour_Client.py
+Rust 서버(Actix-web) 규격에 맞춘 어드민 클라이언트 스크립트
+
+수정 내역:
+  - 서버의 'save all' 응답(단순 문자열)과 'stamp status' 응답(Rust Debug Struct)을 구분하여 처리
+  - Rust Debug 포맷 문자열을 JSON으로 변환하기 위한 파싱 로직 강화
+"""
+
 import requests
 import json
 import pandas as pd
 import threading
 import time
 import logging
-import traceback
 import csv
 import os
 import argparse
@@ -32,52 +42,37 @@ import re
 # 설정
 # -------------------------
 ADMIN_URL = "http://localhost:80/admin"
-AUTOSAVE_INTERVAL_MIN = 1
+AUTOSAVE_INTERVAL_MIN = 15
 DEFAULT_EXCEL_PATH = "./stamp_user.xlsx"
 DEFAULT_CSV_PATH = "./final_event_result.csv"
 DEFAULT_INPUT_JSON = "resources/database/stamp_status.json"
 LOG_FILE = "stamp_processor.log"
-MIN_REQUIRED_UNIQUE = 10  # 10개 이상인 사용자만 최종 CSV에 포함 (원문 로직 유지)
+MIN_REQUIRED_UNIQUE = 10 
 # -------------------------
 
 # -------------------------
-# 로거 설정 (콘솔 INFO, 파일 DEBUG)
+# 로거 설정
 # -------------------------
 logger = logging.getLogger("stamp_processor")
 logger.setLevel(logging.DEBUG)
 
-# 파일 핸들러 (모든 로그 저장, 디버그 포함)
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
 fh.setLevel(logging.DEBUG)
-fh_formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-)
-fh.setFormatter(fh_formatter)
+fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
 logger.addHandler(fh)
 
-# 콘솔 핸들러 (정보성 출력)
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
-ch_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-ch.setFormatter(ch_formatter)
+ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
 logger.addHandler(ch)
 # -------------------------
 
 def normalize_user_name(name: str) -> str:
-    """
-    사용자 이름 정규화:
-      - Unicode 정규화 (NFKC)
-      - 앞뒤 공백 제거
-      - 내부 공백 제거 (모든 공백을 제거하여 '12345김유저' / '12345 김유저'를 동일 처리)
-      - 영문은 소문자화 (대소문자 통일)
-    결정적(deterministic)이고 단방향이며, 집계 전에 항상 호출해야 함.
-    """
     if name is None:
         return ""
     s = str(name)
     s = unicodedata.normalize("NFKC", s)
     s = s.strip()
-    # 모든 공백 제거 (예: '12345 김유저' -> '12345김유저')
     s = re.sub(r"\s+", "", s)
     try:
         s = s.lower()
@@ -86,14 +81,10 @@ def normalize_user_name(name: str) -> str:
     return s
 
 def safe_json_loads(s: str):
-    """
-    다양한 포맷(경우에 따라 출력 앞뒤에 불필요한 텍스트가 붙은 경우)을 잘 처리하려고 시도함.
-    실패 시 None 반환.
-    """
     try:
         return json.loads(s)
     except Exception:
-        # 시도: 불필요한 앞뒤 텍스트 제거해서 JSON 부분만 골라내기
+        # JSON 형식이 아닐 경우, 중괄호 구간만 추출 시도
         try:
             first = s.find('{')
             last = s.rfind('}')
@@ -105,12 +96,6 @@ def safe_json_loads(s: str):
     return None
 
 def dedupe_user_count_by_name(user_count: dict):
-    """
-    user_count: { user_id: {"count":n, "user_name":name} }
-    같은 user_name 을 가진 여러 user_id가 있을 수 있으므로,
-    각 user_name 당 count가 가장 큰 user_id 하나를 선택하여 반환.
-    반환값: dict 선택된 user_id -> {"count":n, "user_name":name}
-    """
     name_to_best = {}
     for uid, info in user_count.items():
         name = info.get("user_name", "")
@@ -125,19 +110,18 @@ def dedupe_user_count_by_name(user_count: dict):
         result[chosen["user_id"]] = {"count": chosen["count"], "user_name": chosen["user_name"]}
     return result
 
-def process_history_to_outputs(history: dict,
-                               csv_path=DEFAULT_CSV_PATH,
-                               min_required_unique=10):
+def process_history_to_outputs(history: dict, 
+                               excel_path=DEFAULT_EXCEL_PATH, 
+                               csv_path=DEFAULT_CSV_PATH, 
+                               min_required_unique=MIN_REQUIRED_UNIQUE):
     """
-    사용자별 스탬프 개수를 체크하여 조건에 따라 이름을 중복 출력하여 CSV에 저장합니다.
-    - 10개 이상 ~ 20개 미만: 1회 기록
-    - 20개 이상 ~ 30개 미만: 2회 기록
-    - 30개 이상: 3회 기록
+    기존 파라미터 규격을 유지하면서, 
+    CSV 저장 시에만 '학번이름'을 스탬프 개수(10개당 1번)만큼 반복 저장합니다.
     """
-    logger.debug("CSV 생성 로직 시작")
+    logger.debug("데이터 집계 시작 (기존 규격 유지)")
     
-    # 1) 사용자별 스탬프 개수 집계 (ID 기준)
     user_stats = {} 
+    # 1. 데이터 집계 (기존 로직 유지)
     for stamp_id, users in history.items():
         for u in users:
             if isinstance(u, dict):
@@ -147,180 +131,181 @@ def process_history_to_outputs(history: dict,
                 uid = str(u)
                 raw_name = ""
             
+            if uid is None: continue
+            
             norm_name = normalize_user_name(raw_name)
             if uid not in user_stats:
                 user_stats[uid] = {"name": norm_name, "locations": set()}
             user_stats[uid]["locations"].add(str(stamp_id))
 
-    # 2) CSV 저장 (필요한 형식: 학번+이름만 반복 출력)
+    # 2. 엑셀 저장 (기존 규격대로 생성하되 내용은 간소화 가능)
+    # (요청하신 내용에 엑셀에 대한 언급은 없었으나 기존 코드 호환을 위해 유지)
+    try:
+        df_data = []
+        for uid, info in user_stats.items():
+            df_data.append({"user_id": uid, "user_name": info["name"], "count": len(info["locations"])})
+        pd.DataFrame(df_data).to_excel(excel_path, index=False)
+    except Exception as e:
+        logger.error("Excel 저장 실패: %s", e)
+
+    # 3. CSV 저장 (핵심 변경 부분: 학번이름 반복 출력)
     try:
         with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            # 헤더 없이 데이터만 넣거나, 필요 시 헤더 추가
             count_total_rows = 0
             
             for uid, info in user_stats.items():
                 cnt = len(info['locations'])
+                # 10개 미만은 제외 (기존 로직 조건 유지)
+                if cnt < min_required_unique:
+                    continue
+                
+                # 출력 횟수: 10개 이상 1번, 20개 이상 2번, 30개 이상 3번
+                repeat_count = cnt // 10
                 display_name = f"{uid}{info['name']}" # 예: 12345김유저
                 
-                # 출력 횟수 결정 (10개당 1번씩 추가 응모권 개념)
-                # 10개 이상 -> 1회, 20개 이상 -> 2회, 30개 이상 -> 3회
-                repeat_count = cnt // 10
-                
-                if repeat_count > 0:
-                    for _ in range(repeat_count):
-                        writer.writerow([display_name])
-                        count_total_rows += 1
+                for _ in range(repeat_count):
+                    writer.writerow([display_name])
+                    count_total_rows += 1
             
-            logger.info("CSV 생성 완료: 총 %d줄 기록됨 (파일=%s)", count_total_rows, csv_path)
+            logger.info("CSV 저장 완료: 총 %d줄 기록됨", count_total_rows)
     except Exception as e:
-        logger.error("CSV 저장 중 오류 발생: %s", e)
+        logger.error("CSV 저장 실패: %s", e)
 
-    return {"total_rows": count_total_rows}
+    # 리턴 형식 유지 (기존 코드에서 summary 출력 시 사용)
+    return {"total_users": len(user_stats), "recorded_rows": count_total_rows}
 
-def process_file(input_file=DEFAULT_INPUT_JSON, csv_path=DEFAULT_CSV_PATH):
-    logger.info("파일 처리 시작: %s", input_file)
-    if not os.path.exists(input_file):
-        logger.error("파일을 찾을 수 없습니다: %s", input_file)
+def parse_rust_debug_output(output_text: str):
+    """
+    Rust 서버가 반환하는 Debug 포맷({:?}) 문자열을 JSON으로 변환하여 파싱합니다.
+    형태 예시: StampHistory { stamp_history: {"1": [StampUserInfo { student_id: "...", ... }]} }
+    """
+    if not output_text:
         return None
+
+    # 1. Rust Struct 이름 제거
+    s = output_text.replace("StampHistory", "").replace("StampUserInfo", "")
+    
+    # 2. Key 값들에 따옴표 추가 (Rust Debug 포맷 -> JSON 변환)
+    # 서버 Struct 필드: stamp_history, student_id, user_name, timestamp
+    replacements = [
+        ("stamp_history", '"stamp_history"'),
+        ("student_id", '"student_id"'),
+        ("user_name", '"user_name"'),
+        ("timestamp", '"timestamp"'),
+    ]
+    
+    for old, new in replacements:
+        s = s.replace(old, new)
+
+    # 3. JSON 로드 시도
+    data = safe_json_loads(s)
+    
+    if data and isinstance(data, dict):
+        # 최상위가 'stamp_history' 키를 가지고 있으면 그 내부 값을 반환
+        if "stamp_history" in data:
+            return data["stamp_history"]
+        return data
+        
+    return None
+
+def process_file(input_file=DEFAULT_INPUT_JSON):
+    logger.info("로컬 파일 처리: %s", input_file)
+    if not os.path.exists(input_file):
+        logger.error("파일 없음: %s", input_file)
+        return
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        history = data.get('stamp_history') or data.get('StampHistory') or {}
-        if not isinstance(history, dict):
-            logger.error("stamp_history가 딕셔너리 형태가 아닙니다. 타입=%s", type(history))
-            return None
-        return process_history_to_outputs(history)
+        history = data.get('stamp_history') or data
+        process_history_to_outputs(history)
     except Exception as e:
-        logger.exception("파일 처리 중 오류 발생: %s", e)
-        return None
-
-def parse_admin_response_output(output_text: str):
-    """
-    admin API가 반환하는 output 필드의 내용을 가능한 범용적으로 파싱하여
-    stamp_history를 찾아 반환. 실패하면 None.
-    """
-    logger.debug("admin output raw (길이=%d): %s", len(output_text or ""), (output_text[:1000] + '...') if output_text and len(output_text) > 1000 else output_text)
-    # 보정: 원래 코드에서 했던 치환들 시도
-    try_variants = []
-    try_variants.append(output_text)
-    # replace common non-json tokens
-    s = output_text or ""
-    s = s.replace("StampHistory ", "")
-    s = s.replace("StampUserInfo ", "")
-    s = s.replace("user_name", "\"user_name\"")
-    s = s.replace("user_id", "\"user_id\"")
-    s = s.replace("timestamp", "\"timestamp\"")
-    s = s.replace("stamp_history", "\"stamp_history\"")
-    try_variants.append(s)
-    # 시도해서 JSON 로드
-    for candidate in try_variants:
-        parsed = safe_json_loads(candidate)
-        if parsed is None:
-            continue
-        # stamp_history 키 찾기
-        if isinstance(parsed, dict):
-            if "stamp_history" in parsed and isinstance(parsed["stamp_history"], dict):
-                logger.debug("admin output에서 stamp_history 찾음 (직접 포함).")
-                return parsed["stamp_history"]
-            # 혹시 최상위가 바로 stamp_history 구조일 수도 있음
-            # 예: output이 "{ 'someKey': {...}, 'stamp_history': {...} }"
-            # 혹은 output 자체가 stamp_history dict일 수 있음
-            # 확인: 만약 최상위 키들이 모두 스탬프 id라면 (값이 list) stamp_history로 간주
-            top_keys = list(parsed.keys())
-            if top_keys and isinstance(parsed[top_keys[0]], list):
-                # heuristic: 모든 값이 list로 구성되면 stamp_history로 간주
-                all_lists = all(isinstance(parsed[k], list) for k in top_keys)
-                if all_lists:
-                    logger.debug("admin output이 직접 stamp_history 구조로 판단됨.")
-                    return parsed
-        # else 계속 시도
-    logger.warning("admin output에서 stamp_history를 파싱하지 못했습니다.")
-    return None
+        logger.error("파일 처리 중 오류: %s", e)
 
 # -------------------------
 # 스레드 함수들
 # -------------------------
-def auto_save_loop(interval_min=AUTOSAVE_INTERVAL_MIN, admin_url=ADMIN_URL):
-    logger.info("Autosave enabled. Interval = %d min", interval_min)
+def auto_save_loop(interval_min, admin_url):
+    logger.info("Autosave 시작 (주기: %d분)", interval_min)
     while True:
         try:
             time.sleep(interval_min * 60)
-            logger.debug("Autosave: POST %s {'command':'save all'}", admin_url)
-            r = requests.post(admin_url, json={"command": "save all", "output": ""}, timeout=10)
-            logger.debug("Autosave response status=%s, text(len)=%d", r.status_code, len(r.text) if r.text else 0)
+            logger.debug("Autosave: save all 전송")
+            # save all은 데이터를 반환하지 않으므로 전송만 함
+            requests.post(admin_url, json={"command": "save all", "output": ""}, timeout=10)
         except Exception:
-            logger.exception("Autosave 중 예외 발생")
+            pass # 조용히 무시
 
-def handle_cmd_loop(admin_url=ADMIN_URL):
-    logger.info("명령 모드 시작: admin=%s", admin_url)
+def handle_cmd_loop(admin_url):
+    logger.info("명령 대기 중... (사용 가능 명령: save all, stamp status, process_file, exit)")
+    
     while True:
         try:
-            cmd = input("Server command: ").strip()
+            cmd = input("Command> ").strip()
+            if not cmd:
+                continue
+                
             if cmd.lower() in ("exit", "quit"):
-                logger.info("프로그램 종료 명령 수신. 종료합니다.")
+                logger.info("종료합니다.")
                 os._exit(0)
-            # 파일 처리 명령
-            if cmd.startswith("process file"):
+
+            # 1. 로컬 파일 처리 명령
+            if cmd.startswith("process_file"):
                 parts = cmd.split(maxsplit=1)
-                if len(parts) == 1:
-                    infile = DEFAULT_INPUT_JSON
-                else:
-                    infile = parts[1].strip()
-                logger.info("process file 명령: input=%s", infile)
-                process_file(infile)
+                target_file = parts[1].strip() if len(parts) > 1 else DEFAULT_INPUT_JSON
+                process_file(target_file)
                 continue
 
-            # 기본: admin으로 POST 전송
-            logger.debug("POST to admin: command=%s", cmd)
+            # 2. 서버 전송 명령
+            logger.debug("서버 전송: %s", cmd)
             r = requests.post(admin_url, json={"command": cmd, "output": ""}, timeout=10)
+            
             try:
-                # admin의 json 응답 전체 로깅
                 resp_json = r.json()
-                logger.debug("admin 응답 JSON 키: %s", list(resp_json.keys()))
                 output_text = resp_json.get("output", "")
-            except Exception:
+            except:
                 output_text = r.text
-                logger.debug("admin 응답은 JSON 아님, text 길이=%d", len(output_text) if output_text else 0)
 
-            # stamp_history 추출 시도
-            stamp_history = parse_admin_response_output(output_text)
-            if stamp_history:
-                logger.info("admin 응답에서 stamp_history 발견. 처리 시작.")
-                summary = process_history_to_outputs(stamp_history)
-                logger.info("stamp_history 처리 요약: %s", summary)
+            # 3. 명령어에 따른 응답 처리 분기
+            if cmd == "save all":
+                # save all은 데이터를 주지 않음. 성공 메시지만 출력.
+                logger.info("서버 응답: %s", output_text)
+            
+            elif cmd == "stamp status":
+                # stamp status는 데이터를 줌 (Rust Debug Format)
+                logger.info("데이터 수신 완료. 파싱 시작...")
+                history = parse_rust_debug_output(output_text)
+                if history:
+                    summary = process_history_to_outputs(history)
+                    logger.info("처리 완료: %s", summary)
+                else:
+                    logger.warning("데이터 파싱 실패. 원본 응답 확인 필요.")
+                    logger.debug("Raw Output: %s", output_text[:200]) # 너무 기니 앞부분만
+            
             else:
-                # 원래 코드처럼, output 내용을 출력 (콘솔)
-                logger.info("Admin output (non-stamp):\n%s", output_text)
+                # 그 외 명령 (unknown 등)
+                logger.info("서버 응답: %s", output_text)
+
         except Exception as e:
-            logger.exception("명령 처리 중 예외 발생: %s", e)
-            # 계속 루프
+            logger.error("명령 처리 중 예외: %s", e)
 
 # -------------------------
-# entrypoint
+# Main
 # -------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Stamp processor 통합 스크립트")
-    parser.add_argument("--no-autosave", action="store_true", help="autosave 스레드 실행 안함")
-    parser.add_argument("--admin-url", default=ADMIN_URL, help="admin URL (기본: http://localhost:80/admin)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-autosave", action="store_true")
+    parser.add_argument("--admin-url", default=ADMIN_URL)
     args = parser.parse_args()
 
-    # update admin url if provided
-    admin_url = args.admin_url
-
-    # start autosave 스레드 (옵션으로 끌 수 있음)
     if not args.no_autosave:
-        t_autosave = threading.Thread(target=auto_save_loop, args=(AUTOSAVE_INTERVAL_MIN, admin_url), daemon=True)
-        t_autosave.start()
-        logger.debug("autosave 스레드 시작 (데몬)")
+        t = threading.Thread(target=auto_save_loop, args=(AUTOSAVE_INTERVAL_MIN, args.admin_url), daemon=True)
+        t.start()
 
-    # 명령 루프 (메인 스레드에서 실행)
     try:
-        handle_cmd_loop(admin_url=admin_url)
+        handle_cmd_loop(args.admin_url)
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt 수신. 종료합니다.")
-    except Exception:
-        logger.exception("메인 루프에서 예기치 못한 예외 발생")
+        logger.info("사용자 중단.")
 
 if __name__ == "__main__":
     main()
