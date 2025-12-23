@@ -175,39 +175,46 @@ def process_history_to_outputs(history: dict,
     # 리턴 형식 유지 (기존 코드에서 summary 출력 시 사용)
     return {"total_users": len(user_stats), "recorded_rows": count_total_rows}
 
-def parse_rust_debug_output(output_text: str):
+  def parse_rust_debug_output(output_text: str):
     """
     Rust 서버가 반환하는 Debug 포맷({:?}) 문자열을 JSON으로 변환하여 파싱합니다.
-    형태 예시: StampHistory { stamp_history: {"1": [StampUserInfo { student_id: "...", ... }]} }
+    형태 예시: StampHistory { stamp_history: {"1": [StampUserInfo { ... }]} }
     """
     if not output_text:
         return None
 
-    # 1. Rust Struct 이름 제거
-    s = output_text.replace("StampHistory", "").replace("StampUserInfo", "")
+    # 1. 구조체 이름 제거 (StampHistory { ... } -> { ... })
+    # 영문자+숫자+언더바 뒤에 공백(선택)과 중괄호가 오면, 그냥 중괄호로 변경
+    s = re.sub(r'[a-zA-Z0-9_]+\s*\{', '{', output_text)
     
-    # 2. Key 값들에 따옴표 추가 (Rust Debug 포맷 -> JSON 변환)
-    # 서버 Struct 필드: stamp_history, student_id, user_name, timestamp
-    replacements = [
-        ("stamp_history", '"stamp_history"'),
-        ("student_id", '"student_id"'),
-        ("user_name", '"user_name"'),
-        ("timestamp", '"timestamp"'),
-    ]
+    # 2. 키 값에 따옴표 붙이기 (key: -> "key":)
+    # 주의: URL(http:)이나 시간(12:00) 등이 값에 포함될 경우 오동작 가능성이 있으나,
+    # 현재 데이터 구조(단순 필드명)에서는 이 정규식으로 충분합니다.
+    s = re.sub(r'([a-zA-Z0-9_]+):', r'"\1":', s)
     
-    for old, new in replacements:
-        s = s.replace(old, new)
+    # 3. Trailing Comma 제거 (콤마 뒤에 닫는 괄호/중괄호가 오면 콤마 삭제)
+    s = re.sub(r',\s*([\]}])', r'\1', s)
 
-    # 3. JSON 로드 시도
-    data = safe_json_loads(s)
-    
-    if data and isinstance(data, dict):
-        # 최상위가 'stamp_history' 키를 가지고 있으면 그 내부 값을 반환
-        if "stamp_history" in data:
-            return data["stamp_history"]
-        return data
+    try:
+        # 4. JSON 변환 시도
+        data = json.loads(s)
         
-    return None
+        # 5. [중요] 데이터 구조 맞추기
+        # 서버 응답이 { "stamp_history": { ... } } 형태라면,
+        # 내부의 { ... } 만 반환해야 기존 로직(process_history_to_outputs)이 정상 작동함
+        if isinstance(data, dict) and "stamp_history" in data:
+            return data["stamp_history"]
+        
+        return data
+
+    except json.JSONDecodeError as e:
+        # 파싱 실패 시 원본 문자열 일부를 로그에 남겨 디버깅 도움
+        logger.error(f"JSON 파싱 실패: {e}")
+        logger.debug(f"파싱 시도한 문자열(앞부분): {s[:100]}")
+        return None
+    except Exception as e:
+        logger.error(f"알 수 없는 오류: {e}")
+        return None
 
 def process_file(input_file=DEFAULT_INPUT_JSON):
     logger.info("로컬 파일 처리: %s", input_file)
