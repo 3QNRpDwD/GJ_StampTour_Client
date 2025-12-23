@@ -126,109 +126,57 @@ def dedupe_user_count_by_name(user_count: dict):
     return result
 
 def process_history_to_outputs(history: dict,
-                               excel_path=DEFAULT_EXCEL_PATH,
                                csv_path=DEFAULT_CSV_PATH,
-                               min_required_unique=MIN_REQUIRED_UNIQUE):
+                               min_required_unique=10):
     """
-    history: stamp_history 형태 (stamp_id -> list of user entries)
-    - 각 entry는 student_id 또는 user_id, user_name 등을 포함할 수 있다.
-    - 방문한 장소(stamp_id)를 집합으로 모아 중복 제거
-    - 엑셀과 CSV 파일 생성 (엑셀은 사용자명 인덱스)
-    - CSV는 티켓 계산(10개당 1티켓) 및 방문 장소 목록 포함
-    이름은 항상 normalize_user_name()으로 정규화한 값을 사용하여 집계 및 중복 제거를 수행합니다.
+    사용자별 스탬프 개수를 체크하여 조건에 따라 이름을 중복 출력하여 CSV에 저장합니다.
+    - 10개 이상 ~ 20개 미만: 1회 기록
+    - 20개 이상 ~ 30개 미만: 2회 기록
+    - 30개 이상: 3회 기록
     """
-    logger.debug("process_history_to_outputs 시작 (stamp entries=%d)", len(history))
-    # 1) 사용자별 집계: id 기준
-    user_stats = {}  # id -> { 'name': normalized_name, 'locations': set(), 'raw_names': set() }
-    # permit multiple possible id keys
+    logger.debug("CSV 생성 로직 시작")
+    
+    # 1) 사용자별 스탬프 개수 집계 (ID 기준)
+    user_stats = {} 
     for stamp_id, users in history.items():
         for u in users:
-            # 여러 포맷 허용
-            uid = None
-            raw_name = ""
             if isinstance(u, dict):
-                uid = u.get("student_id") or u.get("user_id") or u.get("id") or u.get("studentId")
-                raw_name = u.get("user_name") or u.get("name") or u.get("userName") or u.get("display_name") or u.get("username") or ""
+                uid = u.get("student_id") or u.get("user_id") or u.get("id")
+                raw_name = u.get("user_name") or u.get("name") or ""
             else:
-                # 만약 단순 문자열이면 user id로 취급
                 uid = str(u)
                 raw_name = ""
-            if uid is None:
-                logger.debug("경고: user entry에서 id를 찾을 수 없음: %s", u)
-                # 생성 임시 id
-                uid = f"unknown_{hash(str(u))}"
+            
             norm_name = normalize_user_name(raw_name)
             if uid not in user_stats:
-                user_stats[uid] = {"name": norm_name, "locations": set(), "raw_names": set()}
-            # raw_names 추적(디버깅/감사 목적)
-            if raw_name:
-                user_stats[uid]["raw_names"].add(raw_name)
+                user_stats[uid] = {"name": norm_name, "locations": set()}
             user_stats[uid]["locations"].add(str(stamp_id))
 
-    logger.info("사용자 집계 완료: 전체 유니크 ID 수 = %d", len(user_stats))
-
-    # 2) 엑셀용: dedupe by normalized user_name (원래 의도) — 중복 이름이 있을 때 방문 수가 많은 ID를 채택
-    # 우선 user_count 형태로 변환
-    user_count = {}
-    for uid, info in user_stats.items():
-        # name은 이미 정규화된 값
-        user_count[uid] = {"count": len(info["locations"]), "user_name": info["name"] or f"<unknown:{uid}>"}
-    logger.debug("user_count 샘플(최대10): %s", list(user_count.items())[:10])
-
-    deduped = dedupe_user_count_by_name(user_count)
-    logger.info("이름 기준 중복 제거 완료: 선택된 ID 수 = %d", len(deduped))
-
-    # 만들어둘 엑셀 데이터프레임
+    # 2) CSV 저장 (필요한 형식: 학번+이름만 반복 출력)
     try:
-        df_excel = pd.DataFrame([
-            {"user_id": uid, "user_name": deduped[uid]["user_name"], "count": deduped[uid]["count"]}
-            for uid in deduped
-        ])
-        if not df_excel.empty:
-            df_excel.set_index("user_name", inplace=True)
-            df_excel.to_excel(excel_path)
-            logger.info("엑셀 파일 저장됨: %s (rows=%d)", os.path.abspath(excel_path), len(df_excel))
-        else:
-            logger.info("엑셀 저장 대상이 없음 (빈 데이터프레임).")
-    except Exception as e:
-        logger.exception("엑셀 저장 중 예외 발생: %s", e)
-
-    # 3) CSV 결과: 파일 기반 처리 (원본 두번째 스크립트 로직과 유사)
-    # 여기서는 student_id 우선, 그리고 'unique location 수 >= min_required_unique' 필터 적용
-    try:
-        # CSV 헤더 기록
         with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            writer.writerow(['학번(ID)', '이름(정규화된)', '인정 스탬프 수(중복제외)', '당첨 기회(Ticket)', '방문한 장소 목록', 'raw_names_sample'])
-            count_qualified = 0
-            logger.info("--- CSV 분석 시작 ---")
+            # 헤더 없이 데이터만 넣거나, 필요 시 헤더 추가
+            count_total_rows = 0
+            
             for uid, info in user_stats.items():
-                unique_locations = info['locations']
-                cnt = len(unique_locations)
-                if cnt < min_required_unique:
-                    logger.debug("건너뜀: %s (%s) - 장소수=%d 미만", info.get("name"), uid, cnt)
-                    continue
-                tickets = cnt // 10
-                location_str = ", ".join(sorted(unique_locations))
-                # raw_names_sample: 같은 uid에서 관측된 원시 이름 일부를 CSV에 남겨 감사에 도움
-                raw_sample = ";".join(list(info.get("raw_names", []))[:3])
-                writer.writerow([uid, info.get("name", ""), cnt, tickets, location_str, raw_sample])
-                logger.info("대상: %s (%s) -> %d곳 방문 -> %d회 응모", info.get("name",""), uid, cnt, tickets)
-                count_qualified += 1
-            logger.info("CSV 처리 완료: %d명 조건 충족 (파일=%s)", count_qualified, os.path.abspath(csv_path))
+                cnt = len(info['locations'])
+                display_name = f"{uid}{info['name']}" # 예: 12345김유저
+                
+                # 출력 횟수 결정 (10개당 1번씩 추가 응모권 개념)
+                # 10개 이상 -> 1회, 20개 이상 -> 2회, 30개 이상 -> 3회
+                repeat_count = cnt // 10
+                
+                if repeat_count > 0:
+                    for _ in range(repeat_count):
+                        writer.writerow([display_name])
+                        count_total_rows += 1
+            
+            logger.info("CSV 생성 완료: 총 %d줄 기록됨 (파일=%s)", count_total_rows, csv_path)
     except Exception as e:
-        logger.exception("CSV 생성 중 예외 발생: %s", e)
+        logger.error("CSV 저장 중 오류 발생: %s", e)
 
-    # 요약 리턴
-    summary = {
-        "total_ids": len(user_stats),
-        "deduped_selected": len(deduped),
-        "qualified_count": count_qualified if 'count_qualified' in locals() else 0,
-        "excel_path": os.path.abspath(excel_path),
-        "csv_path": os.path.abspath(csv_path)
-    }
-    logger.debug("process_history_to_outputs 요약: %s", summary)
-    return summary
+    return {"total_rows": count_total_rows}
 
 def process_file(input_file=DEFAULT_INPUT_JSON, csv_path=DEFAULT_CSV_PATH):
     logger.info("파일 처리 시작: %s", input_file)
