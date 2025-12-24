@@ -30,7 +30,7 @@ DEFAULT_EXCEL_PATH = "./stamp_user.xlsx"
 DEFAULT_CSV_PATH = "./final_event_result.csv"
 DEFAULT_INPUT_JSON = "resources/database/stamp_status.json"
 LOG_FILE = "stamp_processor.log"
-MIN_REQUIRED_UNIQUE = 10 
+MIN_REQUIRED_UNIQUE = 5
 # -------------------------
 
 # -------------------------
