@@ -30,7 +30,7 @@ DEFAULT_EXCEL_PATH = "./stamp_user.xlsx"
 DEFAULT_CSV_PATH = "./final_event_result.csv"
 DEFAULT_INPUT_JSON = "resources/database/stamp_status.json"
 LOG_FILE = "stamp_processor.log"
-MIN_REQUIRED_UNIQUE = 5
+MIN_REQUIRED_UNIQUE = 10
 # -------------------------
 
 # -------------------------
@@ -155,7 +155,7 @@ def process_history_to_outputs(history: dict,
                     continue
                 
                 # 출력 횟수: 10개 이상 1번, 20개 이상 2번...
-                repeat_count = cnt // 10
+                repeat_count = cnt
                 logger.debug("사용자 '%s' (UID: %s)는 추첨 명단에 %d번 포함됩니다.", display_name, uid, repeat_count)
                 
                 for i in range(repeat_count):
